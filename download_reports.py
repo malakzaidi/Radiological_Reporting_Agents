@@ -6,41 +6,39 @@ import json
 import time
 import logging
 import re
-from selenium import webdriver
-from selenium.webdriver.chrome.options import Options
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # Configure logging
 logging.basicConfig(level=logging.DEBUG, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 
 def extract_report_content(url):
-    """Extract the content of a report from radrap.ch using Selenium for JavaScript rendering"""
-    # Set up Selenium for JavaScript rendering
-    options = Options()
-    options.headless = True
-    driver = webdriver.Chrome(options=options)
+    """Extract the content of a report from radrap.ch using requests and BeautifulSoup"""
     try:
-        driver.get(url)
-        time.sleep(2)  # Wait for JavaScript to load
-        soup = BeautifulSoup(driver.page_source, 'html.parser')
-    except Exception as e:
-        logger.error(f"Failed to retrieve {url} with Selenium: {e}")
+        response = requests.get(url, timeout=10)
+        response.raise_for_status()
+    except requests.RequestException as e:
+        logger.error(f"Failed to retrieve {url}: {e}")
         return None
-    finally:
-        driver.quit()
 
-    # Extract report-specific title from URL or heading
-    title_from_url = re.search(r'comptesrendus/(\d+)', url)
-    title = soup.select_one('h1, .report-title, title').text.strip() if soup.select_one('h1, .report-title, title') else f"IRM Report {title_from_url.group(1) if title_from_url else 'Unknown'}"
-    if "rad rap" in title.lower():
+    soup = BeautifulSoup(response.content, 'html.parser')
+
+    # Extract the title more precisely (e.g., "IRM cérébrale")
+    title_element = soup.find('h1') or soup.find('h2') or soup.find('title')
+    title = title_element.text.strip() if title_element else "Unknown Report"
+    if "rad rap" in title.lower() or not title_element:
+        title_from_url = re.search(r'comptesrendus/(\d+)', url)
         title = f"IRM Report {title_from_url.group(1) if title_from_url else 'Unknown'}"
-    logger.info(f"Extracted title: {title}")
+    # Check for specific MRI type in the page (e.g., "IRM cérébrale (générique)")
+    type_element = soup.find(string=re.compile(r'IRM\s*cérébrale\s*\(?.*\)?'))
+    report_type = type_element.strip() if type_element else "MRI"
+    logger.info(f"Extracted title: {title}, Type: {report_type}")
 
     # Initialize report sections
     report_data = {
         "title": title,
         "url": url,
-        "type": "MRI",
+        "type": report_type,
         "content": {
             "Indication": "",
             "Technique": "",
@@ -49,60 +47,50 @@ def extract_report_content(url):
         }
     }
 
-    # Extract raw text from the page
-    raw_text = soup.get_text(separator="\n", strip=True)
+    # Extract all relevant text content
+    elements = soup.select('div, p, h1, h2, h3, h4')
+    raw_text = "\n".join(element.get_text(strip=True) for element in elements if element.get_text(strip=True))
     logger.debug(f"Raw page content: {raw_text[:500]}...")
 
     # Define sections and their order
     section_order = ["Indication", "Technique", "Résultat", "Conclusion"]
-    sections_found = {section: None for section in section_order}
-
-    # Find positions of section headers in the raw text
-    lines = raw_text.split("\n")
     current_section = None
-    for i, line in enumerate(lines):
+    section_content = {section: [] for section in section_order}
+    lines = raw_text.split("\n")
+
+    # Improved section assignment logic
+    for line in lines:
         line = line.strip()
         if not line:
             continue
+        # Check for section headers
+        matched_section = None
         for section in section_order:
-            if section.lower() in line.lower():
-                sections_found[section] = i
-                current_section = section
+            if re.search(rf"^{section}\s*:\s*|^#{section}\s*$", line, re.IGNORECASE):
+                matched_section = section
                 break
-        else:
-            # If no section header is found, append to the current section
-            if current_section:
-                content = report_data["content"].get(current_section, "")
-                report_data["content"][current_section] = f"{content} {line}".strip()
+        if matched_section:
+            current_section = matched_section
+            # Clean the line by removing the section header
+            line = re.sub(rf"^{current_section}\s*:\s*|^#{current_section}\s*$", "", line, flags=re.IGNORECASE).strip()
+            if line:
+                section_content[current_section].append(line)
+        elif current_section:
+            # Add content to the current section only if it doesn't look like unrelated page metadata
+            if not re.search(r"Rad Rap|Accueil|Comptes rendus|Blog|Contact|Nicolas Villard|\d{2}/\d{2}/\d{4}", line):
+                section_content[current_section].append(line)
 
-    # Extract content between sections
-    for i, section in enumerate(section_order):
-        start_idx = sections_found[section]
-        if start_idx is None:
-            continue
-        # Find the end index (next section or end of document)
-        end_idx = None
-        for next_section in section_order[i + 1:]:
-            if sections_found[next_section] is not None:
-                end_idx = sections_found[next_section]
-                break
-        if end_idx is None:
-            end_idx = len(lines)
-        # Extract content for this section
-        section_content = " ".join(line.strip() for line in lines[start_idx:end_idx] if line.strip() and not any(next_section.lower() in line.lower() for next_section in section_order))
-        report_data["content"][section] = section_content.strip()
-
-    # Clean up content (remove section headers from the content itself)
+    # Populate report data with cleaned content
     for section in section_order:
-        content = report_data["content"][section]
-        if content:
-            # Remove the section header from the content
-            content = re.sub(rf"^{section}\s*:\s*", "", content, flags=re.IGNORECASE).strip()
+        content = " ".join(section_content[section]).strip()
+        if content and not re.search(r"Rad Rap|Accueil|Comptes rendus|Blog|Contact|Nicolas Villard|\d{2}/\d{2}/\d{4}", content):
             report_data["content"][section] = content
+        else:
+            report_data["content"][section] = ""  # Leave empty if no valid content
 
     # Log extracted content
     if not any(report_data["content"].values()):
-        logger.warning(f"No content extracted for {url}. Sections may be empty or missing.")
+        logger.warning(f"No content extracted for {url}. Check HTML structure.")
     else:
         for section, content in report_data["content"].items():
             logger.debug(f"Section: {section}, Content: {content[:50]}...")
@@ -110,7 +98,7 @@ def extract_report_content(url):
     return report_data
 
 def download_mri_reports():
-    """Download MRI reports from radrap.ch"""
+    """Download MRI reports from radrap.ch with parallel requests"""
     mri_report_urls = [
         "https://www.radrap.ch/comptesrendus/170",
         "https://www.radrap.ch/comptesrendus/191",
@@ -153,17 +141,25 @@ def download_mri_reports():
         "https://www.radrap.ch/comptesrendus/240",
         "https://www.radrap.ch/comptesrendus/182",
         "https://www.radrap.ch/comptesrendus/138",
+        "https://www.radrap.ch/comptesrendus/100",
+
     ]
 
     all_reports = []
-    for url in mri_report_urls:
-        logger.info(f"Downloading report from {url}")
-        report_data = extract_report_content(url)
-        if report_data:  # Save even if content is empty, as long as title exists
-            all_reports.append(report_data)
-        else:
-            logger.warning(f"Skipping {url} due to failure to retrieve data")
-        time.sleep(1)  # Be polite to the server
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        future_to_url = {executor.submit(extract_report_content, url): url for url in mri_report_urls}
+        for future in as_completed(future_to_url):
+            url = future_to_url[future]
+            try:
+                report_data = future.result()
+                if report_data:
+                    all_reports.append(report_data)
+                    logger.info(f"Successfully downloaded report from {url}")
+                else:
+                    logger.warning(f"Skipping {url} due to failure to retrieve data")
+            except Exception as e:
+                logger.error(f"Error downloading {url}: {e}")
+            time.sleep(0.5)
 
     if not all_reports:
         logger.error("No valid reports downloaded. Check URLs or website structure.")
@@ -172,30 +168,27 @@ def download_mri_reports():
     logger.info(f"Downloaded {len(all_reports)} valid reports")
     return all_reports
 
-def split_and_save_reports(reports, train_ratio=0.7):
+def split_and_save_reports(reports, train_ratio=0.7, save_individual_files=True):
     """Split reports into training and testing sets"""
     random.shuffle(reports)
-    train_size = 29  # Fixed for 41 reports to ensure 29/12 split
+    train_size = 29
     train_reports = reports[:train_size]
     test_reports = reports[train_size:]
 
-    # Save to JSON files
     os.makedirs("Knowledge/training", exist_ok=True)
     os.makedirs("Knowledge/testing", exist_ok=True)
 
-    # Save each training report in individual files
-    for i, report in enumerate(train_reports):
-        report_filename = f"Knowledge/training/report_{i + 1}.json"
-        with open(report_filename, 'w', encoding='utf-8') as f:
-            json.dump(report, f, ensure_ascii=False, indent=2)
+    if save_individual_files:
+        for i, report in enumerate(train_reports):
+            report_filename = f"Knowledge/training/report_{i + 1}.json"
+            with open(report_filename, 'w', encoding='utf-8') as f:
+                json.dump(report, f, ensure_ascii=False, indent=2)
 
-    # Save each testing report in individual files
-    for i, report in enumerate(test_reports):
-        report_filename = f"Knowledge/testing/report_{i + 1}.json"
-        with open(report_filename, 'w', encoding='utf-8') as f:
-            json.dump(report, f, ensure_ascii=False, indent=2)
+        for i, report in enumerate(test_reports):
+            report_filename = f"Knowledge/testing/report_{i + 1}.json"
+            with open(report_filename, 'w', encoding='utf-8') as f:
+                json.dump(report, f, ensure_ascii=False, indent=2)
 
-    # Save consolidated files
     with open("Knowledge/training_reports.json", 'w', encoding='utf-8') as f:
         json.dump(train_reports, f, ensure_ascii=False, indent=2)
 
@@ -211,7 +204,7 @@ if __name__ == "__main__":
         all_reports = download_mri_reports()
 
         logger.info("Splitting reports into training and testing sets...")
-        train_reports, test_reports = split_and_save_reports(all_reports)
+        train_reports, test_reports = split_and_save_reports(all_reports, save_individual_files=True)
 
         logger.info("Done!")
     except Exception as e:
