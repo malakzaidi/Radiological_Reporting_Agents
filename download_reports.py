@@ -34,9 +34,39 @@ def extract_report_content(url, max_retries=2):
         if "rad rap" in title.lower() or not title_element:
             title_from_url = re.search(r'comptesrendus/(\d+)', url)
             title = f"IRM Report {title_from_url.group(1) if title_from_url else 'Unknown'}"
-        # Check for specific MRI type in the page (e.g., "IRM cérébrale (générique)")
-        type_element = soup.find(string=re.compile(r'IRM\s*cérébrale\s*\(?.*\)?'))
-        report_type = type_element.strip() if type_element else "MRI"
+
+        # Extract the report type (e.g., "MSK", "Abdomen", "Pelvis (féminin)", "Pelvis (masculin)", "Neuro-ORL")
+        report_type = "Unknown"
+        # Check for breadcrumb with active item
+        breadcrumb_items = soup.select('li.breadcrumb-item.active[aria-current="page"]')
+        if breadcrumb_items:
+            for item in breadcrumb_items:
+                type_text = item.get_text(strip=True)
+                possible_types = ["MSK", "Abdomen", "Pelvis (féminin)", "Pelvis (masculin)", "Neuro-ORL"]
+                for t in possible_types:
+                    if t in type_text:
+                        report_type = t
+                        break
+                if report_type != "Unknown":
+                    break
+        # Fallback: infer from title if not found in breadcrumb
+        if report_type == "Unknown":
+            title_lower = title.lower()
+            if "cérébrale" in title_lower or "crânienne" in title_lower or "neuro" in title_lower:
+                report_type = "Neuro-ORL"
+            elif "abdomen" in title_lower or "abdominale" in title_lower:
+                report_type = "Abdomen"
+            elif "pelvis" in title_lower or "pelvien" in title_lower:
+                if "féminin" in title_lower:
+                    report_type = "Pelvis (féminin)"
+                elif "masculin" in title_lower:
+                    report_type = "Pelvis (masculin)"
+                else:
+                    report_type = "Pelvis (féminin)"  # Default to féminin if unspecified
+            elif "musculo" in title_lower or "squelettique" in title_lower or "genou" in title_lower or "épaule" in title_lower:
+                report_type = "MSK"
+            logger.warning(f"Type not found in breadcrumb for {url}, inferred as {report_type} from title")
+
         logger.info(f"Extracted title: {title}, Type: {report_type}")
 
         # Initialize report sections
@@ -82,13 +112,15 @@ def extract_report_content(url, max_retries=2):
                     section_content[current_section].append(line)
             elif current_section:
                 # Add content to the current section only if it doesn't look like unrelated page metadata
-                if not re.search(r"Rad Rap|Accueil|Comptes rendus|Blog|Contact|Nicolas Villard|\d{2}/\d{2}/\d{4}", line):
+                if not re.search(r"Rad Rap|Accueil|Comptes rendus|Blog|Contact|Nicolas Villard|\d{2}/\d{2}/\d{4}|Copier\s*directement\s*le\s*CR\s*dans\s*le\s*presse-papier|Copier\s*tout\s*le\s*CRCopier", line):
                     section_content[current_section].append(line)
+                else:
+                    current_section = None  # Reset if metadata is encountered
 
-        # Populate report data with cleaned content
+        # Populate report data with cleaned content, only if meaningful
         for section in section_order:
             content = " ".join(section_content[section]).strip()
-            if content and not re.search(r"Rad Rap|Accueil|Comptes rendus|Blog|Contact|Nicolas Villard|\d{2}/\d{2}/\d{4}", content):
+            if content and len(content.split()) > 2 and not re.search(r"Rad Rap|Accueil|Comptes rendus|Blog|Contact|Nicolas Villard|\d{2}/\d{2}/\d{4}|Copier\s*directement\s*le\s*CR\s*dans\s*le\s*presse-papier|Copier\s*tout\s*le\s*CRCopier", content):
                 report_data["content"][section] = content
             else:
                 report_data["content"][section] = ""  # Leave empty if no valid content
