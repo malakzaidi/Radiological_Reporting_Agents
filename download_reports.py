@@ -12,90 +12,95 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 logging.basicConfig(level=logging.DEBUG, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 
-def extract_report_content(url):
-    """Extract the content of a report from radrap.ch using requests and BeautifulSoup"""
-    try:
-        response = requests.get(url, timeout=10)
-        response.raise_for_status()
-    except requests.RequestException as e:
-        logger.error(f"Failed to retrieve {url}: {e}")
-        return None
-
-    soup = BeautifulSoup(response.content, 'html.parser')
-
-    # Extract the title more precisely (e.g., "IRM cérébrale")
-    title_element = soup.find('h1') or soup.find('h2') or soup.find('title')
-    title = title_element.text.strip() if title_element else "Unknown Report"
-    if "rad rap" in title.lower() or not title_element:
-        title_from_url = re.search(r'comptesrendus/(\d+)', url)
-        title = f"IRM Report {title_from_url.group(1) if title_from_url else 'Unknown'}"
-    # Check for specific MRI type in the page (e.g., "IRM cérébrale (générique)")
-    type_element = soup.find(string=re.compile(r'IRM\s*cérébrale\s*\(?.*\)?'))
-    report_type = type_element.strip() if type_element else "MRI"
-    logger.info(f"Extracted title: {title}, Type: {report_type}")
-
-    # Initialize report sections
-    report_data = {
-        "title": title,
-        "url": url,
-        "type": report_type,
-        "content": {
-            "Indication": "",
-            "Technique": "",
-            "Résultat": "",
-            "Conclusion": ""
-        }
-    }
-
-    # Extract all relevant text content
-    elements = soup.select('div, p, h1, h2, h3, h4')
-    raw_text = "\n".join(element.get_text(strip=True) for element in elements if element.get_text(strip=True))
-    logger.debug(f"Raw page content: {raw_text[:500]}...")
-
-    # Define sections and their order
-    section_order = ["Indication", "Technique", "Résultat", "Conclusion"]
-    current_section = None
-    section_content = {section: [] for section in section_order}
-    lines = raw_text.split("\n")
-
-    # Improved section assignment logic
-    for line in lines:
-        line = line.strip()
-        if not line:
+def extract_report_content(url, max_retries=2):
+    """Extract the content of a report from radrap.ch with retry logic"""
+    for attempt in range(max_retries + 1):
+        try:
+            response = requests.get(url, timeout=10)
+            response.raise_for_status()
+        except requests.RequestException as e:
+            if attempt == max_retries:
+                logger.error(f"Failed to retrieve {url} after {max_retries + 1} attempts: {e}")
+                return None
+            logger.warning(f"Attempt {attempt + 1} failed for {url}: {e}. Retrying...")
+            time.sleep(2 ** attempt)  # Exponential backoff
             continue
-        # Check for section headers
-        matched_section = None
+
+        soup = BeautifulSoup(response.content, 'html.parser')
+
+        # Extract the title more precisely (e.g., "IRM cérébrale")
+        title_element = soup.find('h1') or soup.find('h2') or soup.find('title')
+        title = title_element.text.strip() if title_element else "Unknown Report"
+        if "rad rap" in title.lower() or not title_element:
+            title_from_url = re.search(r'comptesrendus/(\d+)', url)
+            title = f"IRM Report {title_from_url.group(1) if title_from_url else 'Unknown'}"
+        # Check for specific MRI type in the page (e.g., "IRM cérébrale (générique)")
+        type_element = soup.find(string=re.compile(r'IRM\s*cérébrale\s*\(?.*\)?'))
+        report_type = type_element.strip() if type_element else "MRI"
+        logger.info(f"Extracted title: {title}, Type: {report_type}")
+
+        # Initialize report sections
+        report_data = {
+            "title": title,
+            "url": url,
+            "type": report_type,
+            "content": {
+                "Indication": "",
+                "Technique": "",
+                "Résultat": "",
+                "Conclusion": ""
+            }
+        }
+
+        # Extract all relevant text content
+        elements = soup.select('div, p, h1, h2, h3, h4')
+        raw_text = "\n".join(element.get_text(strip=True) for element in elements if element.get_text(strip=True))
+        logger.debug(f"Raw page content: {raw_text[:500]}...")
+
+        # Define sections and their order
+        section_order = ["Indication", "Technique", "Résultat", "Conclusion"]
+        current_section = None
+        section_content = {section: [] for section in section_order}
+        lines = raw_text.split("\n")
+
+        # Improved section assignment logic
+        for line in lines:
+            line = line.strip()
+            if not line:
+                continue
+            # Check for section headers
+            matched_section = None
+            for section in section_order:
+                if re.search(rf"^{section}\s*:\s*|^#{section}\s*$", line, re.IGNORECASE):
+                    matched_section = section
+                    break
+            if matched_section:
+                current_section = matched_section
+                # Clean the line by removing the section header
+                line = re.sub(rf"^{current_section}\s*:\s*|^#{current_section}\s*$", "", line, flags=re.IGNORECASE).strip()
+                if line:
+                    section_content[current_section].append(line)
+            elif current_section:
+                # Add content to the current section only if it doesn't look like unrelated page metadata
+                if not re.search(r"Rad Rap|Accueil|Comptes rendus|Blog|Contact|Nicolas Villard|\d{2}/\d{2}/\d{4}", line):
+                    section_content[current_section].append(line)
+
+        # Populate report data with cleaned content
         for section in section_order:
-            if re.search(rf"^{section}\s*:\s*|^#{section}\s*$", line, re.IGNORECASE):
-                matched_section = section
-                break
-        if matched_section:
-            current_section = matched_section
-            # Clean the line by removing the section header
-            line = re.sub(rf"^{current_section}\s*:\s*|^#{current_section}\s*$", "", line, flags=re.IGNORECASE).strip()
-            if line:
-                section_content[current_section].append(line)
-        elif current_section:
-            # Add content to the current section only if it doesn't look like unrelated page metadata
-            if not re.search(r"Rad Rap|Accueil|Comptes rendus|Blog|Contact|Nicolas Villard|\d{2}/\d{2}/\d{4}", line):
-                section_content[current_section].append(line)
+            content = " ".join(section_content[section]).strip()
+            if content and not re.search(r"Rad Rap|Accueil|Comptes rendus|Blog|Contact|Nicolas Villard|\d{2}/\d{2}/\d{4}", content):
+                report_data["content"][section] = content
+            else:
+                report_data["content"][section] = ""  # Leave empty if no valid content
 
-    # Populate report data with cleaned content
-    for section in section_order:
-        content = " ".join(section_content[section]).strip()
-        if content and not re.search(r"Rad Rap|Accueil|Comptes rendus|Blog|Contact|Nicolas Villard|\d{2}/\d{2}/\d{4}", content):
-            report_data["content"][section] = content
+        # Log extracted content
+        if not any(report_data["content"].values()):
+            logger.warning(f"No content extracted for {url}. Check HTML structure.")
+            return None
         else:
-            report_data["content"][section] = ""  # Leave empty if no valid content
-
-    # Log extracted content
-    if not any(report_data["content"].values()):
-        logger.warning(f"No content extracted for {url}. Check HTML structure.")
-    else:
-        for section, content in report_data["content"].items():
-            logger.debug(f"Section: {section}, Content: {content[:50]}...")
-
-    return report_data
+            for section, content in report_data["content"].items():
+                logger.debug(f"Section: {section}, Content: {content[:50]}...")
+            return report_data
 
 def download_mri_reports():
     """Download MRI reports from radrap.ch with parallel requests"""
@@ -142,7 +147,6 @@ def download_mri_reports():
         "https://www.radrap.ch/comptesrendus/182",
         "https://www.radrap.ch/comptesrendus/138",
         "https://www.radrap.ch/comptesrendus/100",
-
     ]
 
     all_reports = []
@@ -156,22 +160,25 @@ def download_mri_reports():
                     all_reports.append(report_data)
                     logger.info(f"Successfully downloaded report from {url}")
                 else:
-                    logger.warning(f"Skipping {url} due to failure to retrieve data")
+                    logger.warning(f"Skipping {url} after extraction failure")
             except Exception as e:
-                logger.error(f"Error downloading {url}: {e}")
+                logger.error(f"Unexpected error processing {url}: {e}")
             time.sleep(0.5)
 
     if not all_reports:
         logger.error("No valid reports downloaded. Check URLs or website structure.")
         raise ValueError("No valid reports downloaded")
 
-    logger.info(f"Downloaded {len(all_reports)} valid reports")
+    logger.info(f"Downloaded {len(all_reports)} valid reports out of {len(mri_report_urls)} URLs")
+    if len(all_reports) < len(mri_report_urls):
+        missing_urls = [url for url in mri_report_urls if url not in [r["url"] for r in all_reports]]
+        logger.warning(f"Missing reports from URLs: {missing_urls}")
     return all_reports
 
 def split_and_save_reports(reports, train_ratio=0.7, save_individual_files=True):
     """Split reports into training and testing sets"""
     random.shuffle(reports)
-    train_size = 29
+    train_size = 30
     train_reports = reports[:train_size]
     test_reports = reports[train_size:]
 
